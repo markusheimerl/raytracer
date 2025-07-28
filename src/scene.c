@@ -1,31 +1,8 @@
-#ifndef SCENE_H
-#define SCENE_H
-
-#include "mesh.h"
-#include "bvh.h"
-#include <webp/encode.h>
-#include <time.h>
-#include <webp/mux.h>
-
-typedef struct {
-    Vec3 direction;
-    Vec3 color;
-} DirectionalLight;
-
-typedef struct {
-    Mesh* meshes;
-    size_t mesh_count;
-    Camera camera;
-    DirectionalLight light;
-    unsigned char** frames;
-    int frame_count;
-    int current_frame;
-    int width;
-    int height;
-    float scale_factor;
-    int duration_ms;
-    int fps;
-} Scene;
+#include "scene.h"
+#include "accel/bvh.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 
 Scene create_scene(int width, int height, int duration_ms, int fps, float scale_factor) {
     int frame_count = (duration_ms * fps) / 1000;
@@ -61,8 +38,7 @@ void set_scene_camera(Scene* scene, Vec3 position, Vec3 look_at, Vec3 up, float 
 }
 
 void set_scene_light(Scene* scene, Vec3 direction, Vec3 color) {
-    scene->light.direction = vec3_normalize(direction);
-    scene->light.color = color;
+    scene->light = create_directional_light(direction, color);
 }
 
 void next_frame(Scene* scene) {
@@ -70,57 +46,6 @@ void next_frame(Scene* scene) {
     if (scene->current_frame >= scene->frame_count) {
         scene->current_frame = scene->frame_count - 1;
     }
-}
-
-bool intersect_bvh(BVHNode* node, Ray ray, const Triangle* triangles,
-                   float* t_out, float* u_out, float* v_out, int* tri_idx) {
-    if (!ray_aabb_intersect(ray, node->bounds)) return false;
-
-    bool hit = false;
-    float closest_t = *t_out;
-
-    if (node->left == NULL && node->right == NULL) {
-        // Leaf node - test all triangles
-        for (int i = 0; i < node->triangle_count; i++) {
-            float t, u, v;
-            if (ray_triangle_intersect(ray,
-                triangles[node->start_idx + i].v0,
-                triangles[node->start_idx + i].v1,
-                triangles[node->start_idx + i].v2,
-                &t, &u, &v) && t < closest_t) {
-                closest_t = t;
-                *t_out = t;
-                *u_out = u;
-                *v_out = v;
-                *tri_idx = node->start_idx + i;
-                hit = true;
-            }
-        }
-    } else {
-        // Internal node - recurse
-        float t1 = INFINITY, t2 = INFINITY;
-        float u1, v1, u2, v2;
-        int idx1, idx2;
-
-        bool hit1 = node->left ? intersect_bvh(node->left, ray, triangles, &t1, &u1, &v1, &idx1) : false;
-        bool hit2 = node->right ? intersect_bvh(node->right, ray, triangles, &t2, &u2, &v2, &idx2) : false;
-
-        if (hit1 && (!hit2 || t1 < t2)) {
-            *t_out = t1;
-            *u_out = u1;
-            *v_out = v1;
-            *tri_idx = idx1;
-            hit = true;
-        } else if (hit2) {
-            *t_out = t2;
-            *u_out = u2;
-            *v_out = v2;
-            *tri_idx = idx2;
-            hit = true;
-        }
-    }
-
-    return hit;
 }
 
 void render_scene(Scene* scene) {
@@ -134,7 +59,7 @@ void render_scene(Scene* scene) {
                                    (y + 0.5f) / scene->height, 
                                    aspect);
             
-            float closest_t = INFINITY;
+            float closest_t = 1e30f;
             bool hit = false;
             Vec2 hit_uv = {0, 0};
             Vec3 hit_normal = {0, 0, 0};
@@ -195,7 +120,7 @@ void render_scene(Scene* scene) {
                 bool in_shadow = false;
                 for (size_t m = 0; m < scene->mesh_count && !in_shadow; m++) {
                     const Mesh* current_mesh = &scene->meshes[m];
-                    float shadow_t = INFINITY;
+                    float shadow_t = 1e30f;
                     float shadow_u, shadow_v;
                     int shadow_tri_idx;
                     
@@ -229,83 +154,6 @@ void render_scene(Scene* scene) {
             }
         }
     }
-}
-
-// Cubic interpolation helper function
-float cubic_hermite(float A, float B, float C, float D, float t) {
-    float a = -A/2.0f + (3.0f*B)/2.0f - (3.0f*C)/2.0f + D/2.0f;
-    float b = A - (5.0f*B)/2.0f + 2.0f*C - D/2.0f;
-    float c = -A/2.0f + C/2.0f;
-    float d = B;
-
-    return a*t*t*t + b*t*t + c*t + d;
-}
-
-// Get pixel value safely with bounds checking
-uint32_t get_pixel_rgb(unsigned char* frame, int x, int y, int width, int height) {
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x >= width) x = width - 1;
-    if (y >= height) y = height - 1;
-    
-    int idx = (y * width + x) * 3;
-    return (frame[idx] << 16) | (frame[idx + 1] << 8) | frame[idx + 2];
-}
-
-// Bicubic interpolation for a single pixel
-uint32_t bicubic_interpolate(unsigned char* frame, float x, float y, int width, int height) {
-    int x1 = (int)x;
-    int y1 = (int)y;
-    float fx = x - x1;
-    float fy = y - y1;
-
-    // Get 4x4 patch of pixels
-    uint32_t p[4][4];
-    for (int dy = -1; dy <= 2; dy++) {
-        for (int dx = -1; dx <= 2; dx++) {
-            p[dy+1][dx+1] = get_pixel_rgb(frame, x1 + dx, y1 + dy, width, height);
-        }
-    }
-
-    // Interpolate each color channel
-    float r[4], g[4], b[4];
-    
-    // Interpolate horizontally first
-    for (int i = 0; i < 4; i++) {
-        r[i] = cubic_hermite(
-            (p[i][0] >> 16) & 0xFF,
-            (p[i][1] >> 16) & 0xFF,
-            (p[i][2] >> 16) & 0xFF,
-            (p[i][3] >> 16) & 0xFF,
-            fx
-        );
-        g[i] = cubic_hermite(
-            (p[i][0] >> 8) & 0xFF,
-            (p[i][1] >> 8) & 0xFF,
-            (p[i][2] >> 8) & 0xFF,
-            (p[i][3] >> 8) & 0xFF,
-            fx
-        );
-        b[i] = cubic_hermite(
-            p[i][0] & 0xFF,
-            p[i][1] & 0xFF,
-            p[i][2] & 0xFF,
-            p[i][3] & 0xFF,
-            fx
-        );
-    }
-
-    // Interpolate vertically
-    int ri = (int)(cubic_hermite(r[0], r[1], r[2], r[3], fy) + 0.5f);
-    int gi = (int)(cubic_hermite(g[0], g[1], g[2], g[3], fy) + 0.5f);
-    int bi = (int)(cubic_hermite(b[0], b[1], b[2], b[3], fy) + 0.5f);
-
-    // Clamp results
-    ri = ri < 0 ? 0 : (ri > 255 ? 255 : ri);
-    gi = gi < 0 ? 0 : (gi > 255 ? 255 : gi);
-    bi = bi < 0 ? 0 : (bi > 255 ? 255 : bi);
-
-    return (0xFF << 24) | (ri << 16) | (gi << 8) | bi;
 }
 
 void save_scene(Scene* scene, const char* filename) {
@@ -385,28 +233,3 @@ void destroy_scene(Scene* scene) {
     scene->frames = NULL;
     scene->mesh_count = 0;
 }
-
-void update_progress_bar(int frame, int total_frames, clock_t start_time) {
-    printf("\r[");
-    int barWidth = 30;
-    int pos = barWidth * (frame + 1) / total_frames;
-    
-    for (int i = 0; i < barWidth; i++) {
-        if (i < pos) printf("=");
-        else if (i == pos) printf(">");
-        else printf(" ");
-    }
-
-    float progress = (frame + 1.0f) / total_frames * 100.0f;
-    float elapsed = (clock() - start_time) / (float)CLOCKS_PER_SEC;
-    float estimated_total = elapsed * total_frames / (frame + 1);
-    float remaining = estimated_total - elapsed;
-
-    printf("] %.1f%% | Frame %d/%d | %.1fs elapsed | %.1fs remaining", 
-        progress, frame + 1, total_frames, elapsed, remaining);
-    fflush(stdout);
-
-    if (frame == total_frames - 1) printf("\n");
-}
-
-#endif
